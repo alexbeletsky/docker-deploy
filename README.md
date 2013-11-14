@@ -60,7 +60,7 @@ $ docker-deploy --deploy --sudo \
 	--user core \
 	--host dev.sandbox.local \
 	--tagprefix nyarla \
-	--supervisor upstart
+	--supervisor upstart \
 	/path/to/dockerfile/repository
 ```
 
