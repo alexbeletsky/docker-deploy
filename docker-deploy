@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+
+set -e
+
+APPNAME=$(basename $0)
+VERSION='0.0.1'
+
+usage() {
+    cat<<EOD
+${APPNAME} - version ${VERSION}
+
+Usage: ${APPNAME} [options] <Dockerfile repository>
+
+  Options:
+    --build                     Building Dokerfile in remote docker server
+    --deploy                    Deploying built Docker's container image
+    --supervisor <system>       Specifying supervisor system (e.g. upstart)
+    --tagprefix <\`whoami\`>      Prefix for Docker's -t option 
+    --sudo                      Using sudo when runnning remote command
+
+    --user   <USERNAME>         Username for SSH
+    --host   <ADDRESS>          Host address for SSH    
+    --port   <22>               Port number for SSH
+    --sshkey <.ssh/id_rsa>      SSH pubic key
+
+    -h, --help                  Show this ;-)
+    -v, --version               Show version of this script
+EOD
+}
+
+OPTS_SUDO=0
+OPTS_BUILD=0
+OPTS_DEPLOY=0
+OPTS_REPO=`pwd`
+OPTS_SSH=~/.ssh/id_rsa
+OPTS_USER=""
+OPTS_HOST=""
+OPTS_PORT="22"
+OPTS_PASS=""
+OPTS_TAGPREFIX=`whoami`
+OPTS_SUPERVISOR=""
+
+for OPT in "${@}"
+do
+    case "${OPT}" in
+        '-h' | '--help' )
+            usage
+            exit 1
+            ;;
+        '-v', | '--version' )
+            echo $VERSION
+            exit 1
+            ;;
+        '--sudo' )
+            OPTS_SUDO=1
+            shift 1
+            ;;
+        '--build' )
+            OPTS_BUILD=1
+            shift 1
+            ;;
+        '--deploy' )
+            OPTS_DEPLOY=1
+            shift 1
+            ;;
+        '--user' )
+            if [[ -z "$2"  ]] || [[ "$2" =~ ^-+ ]]; then
+                echo "${APPNAME}: option is required an argument: $1" 1>&2
+                exit 1
+            fi;
+            OPTS_USER="$2"
+            shift 2
+            ;;
+        '--host' )
+            if [[ -z "$2"  ]] || [[ "$2" =~ ^-+ ]]; then
+                echo "${APPNAME}: option is required an argument: $1" 1>&2
+                exit 1
+            fi;
+            OPTS_HOST="$2"
+            shift 2
+            ;;
+        '--port' )
+            if [[ -z "$2"  ]] || [[ "$2" =~ ^-* ]]; then
+                shift 1
+            else
+                OPTS_HOST="$2"
+                shift 2;
+            fi
+            ;;
+        '--sshkey' )
+            if [[ -z "$2"  ]] || [[ "$2" =~ ^-* ]]; then
+                shift 1
+            else
+                OPTS_SSH="$2"
+                shift 2;
+            fi
+            ;;
+        '--tagprefix')
+            if [[ -z "$2" ]] || [[ "$2" =~ ^-+ ]]; then
+                shift 1
+            else
+                OPTS_TAGPREFIX="$2"
+                shift 2;
+            fi
+            ;;
+        '--supervisor')
+            if [[ -z "$2" ]] || [[ "$2" =~ ^-+ ]]; then
+                echo "${APPNAME}: option is required an argument: $1" 1>&2
+                exit 1
+            else
+                OPTS_SUPERVISOR="$2"
+                shift 2
+            fi
+            ;;
+        -*)
+            echo "${APPNAME} unknown option -- '$(echo $1 | set 'sed /^-*//')'" 1>&2
+            exit 1
+            ;;
+        *)
+            if [[ ! -z "$1" ]] && [[ ! "$1" =~ ^-+ ]]; then
+                OPTS_REPO=$1
+                shift 1;
+            fi;
+            ;;
+    esac
+done
+
+if [ -z "${OPTS_USER}" ]; then
+    echo "${APPNAME}: ssh username is empty. --user option is required." 1>&2
+    exit 1;
+fi
+
+if [ -z "${OPTS_HOST}" ]; then
+    echo "${APPNAME}: ssh hostname is empty. --host option is required." 1>&2
+    exit 1;
+fi
+
+if [ $OPTS_SUDO -eq 1 ]; then
+    echo -n "sudo password: "
+    read -s OPTS_PASS
+fi;
+
+SSH_HOST="${OPTS_USER}@${OPTS_HOST}"
+SSH_CMD="ssh -p ${OPTS_PORT} -i ${OPTS_SSH}"
+
+remote_home() {
+    if [ "${OPTS_USER}" = 'root' ]; then
+        echo "/root"
+    else
+        echo "/home/${OPTS_USER}"
+    fi
+}
+
+repo_dir() {
+    echo `cd ${OPTS_REPO} && pwd`
+}
+
+repo_path() {
+    repodir=`repo_dir`
+    reponame=`basename ${repodir}`
+    repopath="service/${reponame}"
+
+    echo "$(remote_home)/${repopath}"
+}
+
+upload() {
+    repodir=`repo_dir`
+    repopath=`repo_path`
+
+    rsync_opts="-avz --delete "
+    if [ -e "$repodir/.rsyncignore" ]; then
+        rsync_opts+=" --exclude-from ${repodir}/.rsyncignore"
+    fi
+
+
+    $SSH_CMD $SSH_HOST "/bin/bash -c 'mkdir -p ${repopath}'"
+    env RSYNC_RSH="${SSH_CMD}" rsync $rsync_opts $repodir/ "${SSH_HOST}:${repopath}/"
+}
+
+build() {
+    repodir=`repo_dir`
+    reponame=`basename ${repodir}`
+    repopath=`repo_path`
+    filename=".docker-build.sh"
+    runner="${repodir}/${filename}"
+
+    cmdprefix=""
+    if [ $OPTS_SUDO -eq 1 ]; then
+        cmdprefix="echo \"${OPTS_PASS}\" | sudo -S "
+    fi;
+
+    cat<<EOF >$runner
+#!/usr/bin/env bash
+
+set -e
+
+cd ${repopath};
+
+${cmdprefix} docker build -t ${OPTS_TAGPREFIX}/${reponame} .
+
+rm -f \$0
+EOF
+
+    upload
+
+    $SSH_CMD $SSH_HOST "/bin/bash ${repopath}/${filename}"
+    rm $runner
+}
+
+
+deploy() {
+    repodir=`repo_dir`
+    reponame=`basename ${repodir}`
+    repopath=`repo_path`
+    filename=".docker-deploy.sh"
+    runner="${repodir}/.docker-deploy.sh"
+
+    cmdprefix=""
+    if [ $OPTS_SUDO -eq 1 ]; then
+        cmdprefix="echo \"${OPTS_PASS}\" | sudo -S "
+    fi;
+
+    cat<<EOF >$runner
+#!/usr/bin/bash env
+
+set -e
+
+cd ${repopath};
+EOF
+
+    case "$OPTS_SUPERVISOR" in
+        "upstart")
+            if [ ! -f "${repodir}/upstart.conf" ]; then
+                echo "upstart.conf is not found in ${repodir}" 1>&2
+                exit 1
+            fi
+
+            cat<<EOF >>$runner
+${cmdprefix} cp upstart.conf /etc/init/docker-${reponame}.conf
+${cmdprefix} start docker-${reponame}
+EOF
+            ;;
+        "systemd")
+            if [ ! -f "${repodir}/systemd.service" ]; then
+                echo "systemd.service is not found in ${repodir}" 1>&2
+                exit 1
+            fi
+
+            cat<<EOF >>$runner
+${cmdprefix} cp systemd.service /etc/systemd/system/docker-${reponame}.service
+${cmdprefix} systemctl daemon-reload
+${cmdprefix} systemctl start docker-${reponame}.service
+${cmdprefix} systemctl enable docker-${reponame}.service
+EOF
+
+            ;;
+        "coreos")
+            if [ ! -f "${repodir}/coreos.service" ]; then
+                echo "systemd.service is not found in ${repodir}" 1>&2
+                exit 1
+            fi
+
+            cat<<EOF >>$runner
+sudo cp coreos.service /media/state/units/${reponame}.service
+sudo systemctl restart local-enable.service
+EOF
+
+            ;;
+        *)
+            echo "${APPNAME}: Unsupported supervisor: ${OPTS_SUPERVISOR}" 1>&2
+            exit 1
+            ;;
+    esac
+
+    upload
+
+    $SSH_CMD $SSH_HOST "/bin/bash ${repopath}/${filename}"
+    rm $runner
+}
+
+if [ $OPTS_BUILD -eq 1 ]; then
+    build
+fi;
+
+if [ $OPTS_DEPLOY -eq 1 ]; then
+    if [ -z "$OPTS_SUPERVISOR" ]; then
+        echo "${APPNAME}: supervisor is not specified." 1>&2
+        exit 1;
+    fi;
+
+    deploy;
+fi
+
+exit 0;
+
