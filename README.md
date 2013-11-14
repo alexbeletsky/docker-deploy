@@ -5,7 +5,7 @@ Install
 -------
 
 ```
-$ curl -O https://github.com/nyarla/docker-deploy/blob/master/docker-deploy
+$ curl -O https://raw.github.com/nyarla/docker-deploy/master/docker-deploy 
 $ chmod +x docker-deploy
 ```
 
